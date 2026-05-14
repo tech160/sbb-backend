@@ -1,0 +1,65 @@
+name: CD — Huawei Cloud
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [develop, "staging/**", "release/**", main]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy → ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            namespace: sbb-dev
+            deployment: sbb-backend-dev
+          - env: sit
+            namespace: sbb-sit
+            deployment: sbb-backend-sit
+          - env: uat
+            namespace: sbb-uat
+            deployment: sbb-backend-uat
+          - env: prod
+            namespace: sbb-prod
+            deployment: sbb-backend-prod
+
+    environment:
+      name: huawei-${{ matrix.env }}
+
+    steps:
+      - name: Login to Huawei SWR
+        run: |
+          docker login \
+            -u "${{ secrets.HW_REGION }}@${{ secrets.HW_ACCESS_KEY }}" \
+            -p "$(echo -n "${{ secrets.HW_REGION }}@${{ secrets.HW_ACCESS_KEY }}" | \
+                  openssl dgst -sha256 -hmac "${{ secrets.HW_SECRET_KEY }}" -binary | \
+                  openssl enc -base64 -A)" \
+            swr.${{ secrets.HW_REGION }}.myhuaweicloud.com
+
+      - name: Retag & Push to SWR
+        run: |
+          SRC="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.REGISTRY_REPO }}/sbb-backend:${{ matrix.env }}-${{ github.event.workflow_run.head_sha }}"
+          DST="swr.${{ secrets.HW_REGION }}.myhuaweicloud.com/${{ secrets.HW_ORG }}/sbb-backend:${{ matrix.env }}-${{ github.event.workflow_run.head_sha }}"
+          docker pull "$SRC"
+          docker tag  "$SRC" "$DST"
+          docker push "$DST"
+
+      - name: Setup kubectl
+        run: |
+          echo "${{ secrets.HW_KUBECONFIG_B64 }}" | base64 -d > /tmp/kubeconfig
+          echo "KUBECONFIG=/tmp/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Rolling update on CCE
+        run: |
+          IMAGE="swr.${{ secrets.HW_REGION }}.myhuaweicloud.com/${{ secrets.HW_ORG }}/sbb-backend:${{ matrix.env }}-${{ github.event.workflow_run.head_sha }}"
+          kubectl set image deployment/${{ matrix.deployment }} app="$IMAGE" -n ${{ matrix.namespace }}
+          kubectl rollout status deployment/${{ matrix.deployment }} -n ${{ matrix.namespace }} --timeout=5m

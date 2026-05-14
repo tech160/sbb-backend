@@ -1,0 +1,65 @@
+name: CD — GCP
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [develop, "staging/**", "release/**", main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy → ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            service: sbb-backend-dev
+          - env: sit
+            service: sbb-backend-sit
+          - env: uat
+            service: sbb-backend-uat
+          - env: prod
+            service: sbb-backend-prod
+
+    environment:
+      name: gcp-${{ matrix.env }}
+      url: ${{ steps.deploy.outputs.url }}
+
+    steps:
+      - name: Auth GCP (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ matrix.service }}
+          region: ${{ secrets.GCP_REGION }}
+          image: >-
+            ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.REGISTRY_REPO }}/sbb-backend:${{ matrix.env }}-${{ github.event.workflow_run.head_sha }}
+          env_vars: |
+            APP_ENV=${{ matrix.env }}
+            APP_VERSION=${{ github.event.workflow_run.head_sha }}
+          flags: |
+            --allow-unauthenticated
+            --min-instances=1
+            --max-instances=10
+            --cpu=1
+            --memory=256Mi
+            --port=8080
+
+      - name: Health check
+        run: |
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "${{ steps.deploy.outputs.url }}/api/v1/health")
+          [ "$STATUS" = "200" ] || (echo "Health check failed: HTTP $STATUS" && exit 1)

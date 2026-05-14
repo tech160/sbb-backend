@@ -1,0 +1,71 @@
+name: CD — AWS
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [develop, "staging/**", "release/**", main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy → ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            cluster: sbb-cluster-dev
+            service: sbb-backend-dev
+          - env: sit
+            cluster: sbb-cluster-sit
+            service: sbb-backend-sit
+          - env: uat
+            cluster: sbb-cluster-uat
+            service: sbb-backend-uat
+          - env: prod
+            cluster: sbb-cluster-prod
+            service: sbb-backend-prod
+
+    environment:
+      name: aws-${{ matrix.env }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition sbb-backend-${{ matrix.env }} \
+            --query taskDefinition > task-def.json
+
+      - name: Render new task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name: app
+          image: >-
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/sbb-backend:${{ matrix.env }}-${{ github.event.workflow_run.head_sha }}
+          environment-variables: |
+            APP_ENV=${{ matrix.env }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ matrix.service }}
+          cluster: ${{ matrix.cluster }}
+          wait-for-service-stability: true
